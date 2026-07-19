@@ -32,6 +32,7 @@ export class FaceDetection {
       ctx!.clearRect(0, 0, canvasElement.width, canvasElement.height);
 
       // Draw bounding boxes around detected faces
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       predictions.forEach((prediction: any) => {
         const [x, y] = prediction.topLeft;
         const [width, height] = prediction.bottomRight;

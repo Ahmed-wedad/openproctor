@@ -4,6 +4,10 @@ import { initMicrophone, stopMicrophone } from './microphone';
 import { initScreenShare } from './screenshare';
 import { detectTabSwitch } from './tabswitch';
 import { FaceDetection } from './faceDetection';
+import { BehaviorMonitor } from './behaviorMonitor';
+import { FaceAnalytics } from './faceAnalytics';
+import { TelemetryClient } from './telemetry';
+import { SnapshotClient } from './snapshot';
 import { ProctorOptions, VideoStreamHandler, ScreenStreamHandler } from '../types/proctor';
 
 export class Proctor {
@@ -11,6 +15,10 @@ export class Proctor {
     private static screenHandler?: ScreenStreamHandler;
     private static microphoneStream?: MediaStream;
     private static faceDetection: FaceDetection = new FaceDetection();
+    private static behaviorMonitor?: BehaviorMonitor;
+    private static faceAnalytics: FaceAnalytics = new FaceAnalytics();
+    private static telemetryClient?: TelemetryClient;
+    private static snapshotClient?: SnapshotClient;
 
     // Static setup method to initialize camera, microphone, screen share, and tab switch detection
     public static setup(options: ProctorOptions) {
@@ -66,6 +74,56 @@ export class Proctor {
         if (options.onTabSwitch) {
             detectTabSwitch(options.onTabSwitch);
         }
+
+        // Phase 1 (2.1/2.2): behavior monitoring
+        if (options.onBehaviorViolation) {
+            Proctor.behaviorMonitor = new BehaviorMonitor(options.onBehaviorViolation);
+            Proctor.behaviorMonitor.start();
+        }
+
+        // Phase 3 (2.3/3): telemetry client
+        if (options.sessionId && options.telemetryServerUrl) {
+            Proctor.telemetryClient = new TelemetryClient({
+                sessionId: options.sessionId,
+                serverUrl: options.telemetryServerUrl,
+                onError: options.onTelemetryError,
+            });
+        }
+
+        // Phase 2 (2.3): face analytics (runs alongside the BlazeFace overlay)
+        if (options.onFaceAnalytics && options.videoElement) {
+            Proctor.faceAnalytics.start(options.videoElement, (result) => {
+                options.onFaceAnalytics?.(result);
+                // Forward analytics issues as telemetry flags
+                if (Proctor.telemetryClient && result.issues.length > 0) {
+                    for (const issue of result.issues) {
+                        Proctor.telemetryClient.send({
+                            timestamp: result.timestamp,
+                            issue,
+                            detail: {
+                                faceCount: result.faceCount,
+                                gazeDeviationDeg: result.gazeDeviationDeg,
+                                headYawDeg: result.headYawDeg,
+                                headPitchDeg: result.headPitchDeg,
+                                headRollDeg: result.headRollDeg,
+                            },
+                        });
+                    }
+                }
+            }, options.canvasElement);
+        }
+
+        // Phase 3 (3): periodic snapshot capture -> object storage
+        if (options.sessionId && options.telemetryServerUrl && options.videoElement && options.canvasElement) {
+            Proctor.snapshotClient = new SnapshotClient({
+                sessionId: options.sessionId,
+                serverUrl: options.telemetryServerUrl,
+                video: options.videoElement,
+                canvas: options.canvasElement,
+                onError: options.onTelemetryError,
+            });
+            Proctor.snapshotClient.start();
+        }
     }
 
     // Stop camera stream
@@ -87,5 +145,41 @@ export class Proctor {
         if (Proctor.screenHandler) {
             Proctor.screenHandler.stop();
         }
+    }
+
+    // Stop behavior monitoring
+    public static stopBehaviorMonitor() {
+        if (Proctor.behaviorMonitor) {
+            Proctor.behaviorMonitor.stop();
+            Proctor.behaviorMonitor = undefined;
+        }
+    }
+
+    // Stop face analytics loop
+    public static stopFaceAnalytics() {
+        Proctor.faceAnalytics.stop();
+    }
+
+    // Flush and stop the telemetry client
+    public static async stopTelemetry(): Promise<void> {
+        if (Proctor.telemetryClient) {
+            await Proctor.telemetryClient.flush();
+            Proctor.telemetryClient.dispose();
+            Proctor.telemetryClient = undefined;
+        }
+        if (Proctor.snapshotClient) {
+            Proctor.snapshotClient.stop();
+            Proctor.snapshotClient = undefined;
+        }
+    }
+
+    // Stop everything
+    public static async stop() {
+        Proctor.stopCamera();
+        Proctor.stopMicrophone();
+        Proctor.stopScreenShare();
+        Proctor.stopBehaviorMonitor();
+        Proctor.stopFaceAnalytics();
+        await Proctor.stopTelemetry();
     }
 }

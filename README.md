@@ -13,8 +13,10 @@ This repository contains a **Proctoring SDK** that allows:
 
 - **Camera, Microphone, and Screen Sharing**: Capture video, audio, and screen streams.
 - **Real-time Face Detection**: Detect faces from the camera stream using BlazeFace.
+- **Behavior Monitoring (2.1/2.2)**: Detect page blur, window resize, and copy/cut/paste via event listeners.
+- **In-Browser AI Analytics (2.3)**: MediaPipe Face Landmarker tracks face count, eye-gaze deviation, and head pose — emitting lightweight telemetry flags (no raw video streaming).
+- **Backend Microservice (3)**: Node.js + TypeScript service that buffers telemetry in **Redis** (write-behind cache) and bulk-syncs to **PostgreSQL**, stores snapshots in **MinIO**, and exposes a review API for post-exam human auditing.
 - **Proctoring Setup**: Control when to start and stop media streams and face detection.
-- **Stream Uploading**: Send media streams (video, audio, screen) to a server for storage and analysis.
 
 ## Table of Contents
 
@@ -22,7 +24,8 @@ This repository contains a **Proctoring SDK** that allows:
 2. [Using the SDK](#using-the-sdk)
 3. [Face Detection](#face-detection)
 4. [Uploading Streams to Server](#uploading-streams-to-server)
-5. [Contribution Guidelines](#contribution-guidelines)
+5. [Backend Microservice](#backend-microservice)
+6. [Contribution Guidelines](#contribution-guidelines)
 
 ---
 
@@ -196,6 +199,63 @@ app.listen(port, () => {
   console.log(`Server listening at http://localhost:${port}`);
 });
 ```
+
+---
+
+## Backend Microservice
+
+The `server/` directory contains a Node.js + TypeScript microservice that ingests the
+telemetry flags emitted by the SDK, buffers them in **Redis** (write-behind cache), and
+bulk-syncs them to **PostgreSQL**. Snapshots are stored in **MinIO** (S3-compatible) and a
+review API lets administrators audit flagged sessions after the exam.
+
+### Architecture
+
+```
+Browser (telemetry flags) ──POST /api/telemetry──▶ Redis buffer
+                                               └─▶ [sync worker, 5s] ──▶ PostgreSQL
+Browser (snapshot)        ──POST /api/snapshot──▶ MinIO
+Admin                     ──GET  /api/review/:id─▶ PostgreSQL + signed MinIO URLs
+```
+
+### Run with Docker (Postgres + Redis + MinIO)
+
+```bash
+docker-compose up -d
+```
+
+### Configure & run the server
+
+```bash
+cd server
+cp .env.example .env      # adjust DB_URL / REDIS_URL / MINIO_* as needed
+npm install
+npm run db:init           # create tables (or let initDb() create them on boot)
+npm run dev               # tsx watch
+```
+
+### Environment variables
+
+| Var | Default | Purpose |
+|-----|---------|---------|
+| `PORT` | `4000` | Microservice port |
+| `DB_URL` | `postgres://openproctor:openproctor@localhost:5432/openproctor` | PostgreSQL connection |
+| `REDIS_URL` | `redis://localhost:6379` | Redis (telemetry write-behind cache) |
+| `MINIO_*` | `localhost:9000` / `minioadmin` | MinIO object storage |
+| `CONSECUTIVE_VIOLATIONS_THRESHOLD` | `5` | Consecutive violations before a session is flagged |
+
+### API
+
+- `POST /api/telemetry` — body `{ sessionId, flags: [{ timestamp, issue, detail }] }`. Flags are buffered in Redis; the sync worker flushes them to Postgres. If ≥ `CONSECUTIVE_VIOLATIONS_THRESHOLD` consecutive violations occur, the session status is set to `flagged`.
+- `POST /api/snapshot` — `multipart/form-data` with `file`, `sessionId`, `timestamp`. Stored in MinIO.
+- `GET /api/sessions` — list sessions (flagged first).
+- `GET /api/review/:sessionId` — telemetry, violations, and signed snapshot URLs for a session.
+
+### Frontend wiring
+
+Set `NEXT_PUBLIC_PROCTOR_SERVER` (defaults to `http://localhost:4000`) so the SDK knows where
+to send telemetry and snapshots. The demo page (`app/page.tsx`) shows a live behavior-violation
+log and MediaPipe face-analytics panel.
 
 ---
 

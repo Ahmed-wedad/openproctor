@@ -1,4 +1,35 @@
+# Dependencies
 node_modules
-.next
+.pnpm-store
 
+# Build output
+.next
+out
+dist
+build
+*.tsbuildinfo
+
+# Environment
 .env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Docker / local data
+docker-compose.override.yml
+*.local
+
+# Server runtime
+server/dist
+server/node_modules
