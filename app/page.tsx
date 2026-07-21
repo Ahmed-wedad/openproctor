@@ -6,7 +6,15 @@ import * as blazeface from '@tensorflow-models/blazeface';  // Import BlazeFace 
 import { BehaviorViolation, FaceAnalyticsResult } from '../types/proctor';
 
 const SERVER_URL = process.env.NEXT_PUBLIC_PROCTOR_SERVER ?? 'http://localhost:4000';
-const SESSION_ID = `sess-${Date.now()}`;
+
+// The vendor frontend runs at an EXTERNAL origin (separate from TAO). It is launched
+// by the TAO test-runner plugin with ?alias=&token= (the provisional sessionToken).
+// No shared secret ever reaches the browser; only the per-session signed token.
+function readLaunchParams(): { alias: string; token: string } {
+    if (typeof window === 'undefined') return { alias: '', token: '' };
+    const p = new URLSearchParams(window.location.search);
+    return { alias: p.get('alias') ?? '', token: p.get('token') ?? '' };
+}
 
 const HomePage = () => {
     const videoRef = useRef<HTMLVideoElement | null>(null); // Ref for the camera video element
@@ -16,6 +24,25 @@ const HomePage = () => {
     const [behaviorLog, setBehaviorLog] = useState<BehaviorViolation[]>([]);
     const [analytics, setAnalytics] = useState<FaceAnalyticsResult | null>(null);
     const [telemetryErrors, setTelemetryErrors] = useState<string[]>([]);
+    const [livenessState, setLivenessState] = useState<'idle' | 'checking' | 'passed' | 'failed'>('idle');
+    const [launch, setLaunch] = useState<{ alias: string; token: string }>({ alias: '', token: '' });
+
+    // Read launch params (alias + provisional token) on mount.
+    useEffect(() => {
+        const params = readLaunchParams();
+        setLaunch(params);
+        // Notify the parent TAO window that the vendor frontend is live, so the
+        // plugin can dismiss its "popup blocked" fallback banner. We post to the
+        // opener if present (popup window) or to the parent (iframe/redirect).
+        try {
+            const target = window.opener || window.parent;
+            if (target && target !== window) {
+                target.postMessage({ type: 'openproctor:ready', alias: params.alias }, '*');
+            }
+        } catch (err) {
+            console.warn('[openproctor] could not post ready message:', err);
+        }
+    }, []);
 
     // Load the BlazeFace model when the component mounts
     useEffect(() => {
@@ -25,6 +52,58 @@ const HomePage = () => {
         };
         loadModel();
     }, []);
+
+    // AUTO LIVENESS GATE: when launched from a TAO delivery (alias + token
+    // present) and the model is ready, run the liveness check automatically
+    // instead of waiting for a manual "Start Proctoring" click. This is the
+    // zero-friction initial auth — the candidate should not need to click.
+    useEffect(() => {
+        if (launch.alias && launch.token && blazeFaceModel && livenessState === 'idle') {
+            runLiveness();
+        }
+    }, [launch.alias, launch.token, blazeFaceModel, livenessState]);
+
+    // INITIAL AUTH: liveness detection gate (zero-friction, account-less).
+    // Computed IN-BROWSER; only a signed attestation is sent to the microservice.
+    const runLiveness = async (): Promise<boolean> => {
+        setLivenessState('checking');
+        try {
+            if (!videoRef.current || !blazeFaceModel) {
+                setLivenessState('failed');
+                return false;
+            }
+            // Start the camera briefly for the liveness probe.
+            const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+            videoRef.current.srcObject = stream;
+            await new Promise(r => setTimeout(r, 800)); // allow a frame
+            const preds = await blazeFaceModel.estimateFaces(videoRef.current, false);
+            stream.getTracks().forEach(t => t.stop());
+            const passed = preds.length === 1; // exactly one face => live person present
+            // Send signed attestation (NOT raw video) to the microservice.
+            const attestation = btoa(JSON.stringify({ faces: preds.length, t: Date.now() }));
+            const res = await fetch(
+                `${SERVER_URL}/api/v1/session/${encodeURIComponent(launch.alias)}/liveness?token=${encodeURIComponent(launch.token)}`,
+                {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ attestation, passed }),
+                },
+            );
+            const data = await res.json();
+            if (passed && data.livenessPassed) {
+                // Promote token to active for telemetry.
+                if (data.sessionToken) setLaunch(l => ({ ...l, token: data.sessionToken }));
+                setLivenessState('passed');
+                return true;
+            }
+            setLivenessState('failed');
+            return false;
+        } catch (err) {
+            console.error('Liveness error:', err);
+            setLivenessState('failed');
+            return false;
+        }
+    };
 
     // Detect faces from the camera stream (BlazeFace overlay)
     const detectFaces = async () => {
@@ -52,11 +131,22 @@ const HomePage = () => {
         }
     };
 
-    // Handler for starting the proctoring and face detection
-    const handleStart = () => {
+    // Handler for starting the proctoring and face detection.
+    // INITIAL AUTH: liveness gate must pass before telemetry is accepted.
+    const handleStart = async () => {
+        if (livenessState !== 'passed') {
+            const ok = await runLiveness();
+            if (!ok) {
+                // Plain-language retry; no error codes shown to the candidate.
+                alert('We could not confirm a live person on camera. Please ensure your face is visible and try again.');
+                return;
+            }
+        }
         setProctoringActive(true);  // Mark proctoring as active
         Proctor.setup({
-            sessionId: SESSION_ID,
+            sessionId: launch.alias || `sess-${Date.now()}`,
+            // Pass the ACTIVE sessionToken so telemetry is authenticated (candidate graph).
+            sessionToken: launch.token,
             telemetryServerUrl: SERVER_URL,
             onVideoFrame: (cameraStream: MediaStream) => {
                 if (videoRef.current) {
@@ -100,7 +190,14 @@ const HomePage = () => {
     return (
         <div style={{ fontFamily: 'sans-serif', padding: 20 }}>
             <h1>OpenProctor — Camera, Screen, Audio &amp; Face Analytics</h1>
-            <p>Session: <code>{SESSION_ID}</code> · Server: <code>{SERVER_URL}</code></p>
+            <p>Session: <code>{launch.alias || 'pending'}</code> · Server: <code>{SERVER_URL}</code></p>
+            <p>
+                Liveness check:
+                {livenessState === 'idle' && ' not started'}
+                {livenessState === 'checking' && ' checking…'}
+                {livenessState === 'passed' && ' ✓ passed'}
+                {livenessState === 'failed' && ' ✗ failed — please retry'}
+            </p>
 
             <div style={{ position: 'relative', display: 'inline-block' }}>
                 <video

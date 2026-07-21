@@ -1,0 +1,114 @@
+# OpenProctor deploy tasks — survives remote-host wipes.
+# After a pod wipe:
+#   docker compose -f docker-compose.dev.yml up -d   # bring TAO CE back
+#   task:deploy                                        # rebuild + run openproctor stack
+version: '3'
+
+vars:
+  REGISTRY: ghcr.io/{{.GITHUB_REPOSITORY | default "your-org/openproctor"}}
+  TAG:
+    sh: git rev-parse --short HEAD
+  NETWORK: tao-ce-net
+  SERVER_IMAGE: '{{.REGISTRY}}/openproctor-server:{{.TAG}}'
+  FRONTEND_IMAGE: '{{.REGISTRY}}/openproctor-frontend:{{.TAG}}'
+
+tasks:
+  # Build images locally (or rely on CI-pushed GHCR images).
+  build:
+    desc: Build openproctor server + frontend images
+    cmds:
+      - docker build -t {{.SERVER_IMAGE}} ./server
+      - docker build -t {{.FRONTEND_IMAGE}} -f ./app/Dockerfile .
+
+  # Apply DB schema + run the microservice + frontend on the TAO CE network.
+  deploy:
+    desc: Deploy openproctor stack (server + frontend) on tao-ce-net
+    deps: [schema]
+    cmds:
+      - docker rm -f openproctor-api openproctor-fe || true
+      - docker run -d --name openproctor-api --network {{.NETWORK}} --env-file ./server/.env.tao -p 4000:4000 {{.SERVER_IMAGE}}
+      - docker run -d --name openproctor-fe --network {{.NETWORK}} -e NEXT_PUBLIC_PROCTOR_SERVER=http://openproctor-api:4000 -p 3000:3000 {{.FRONTEND_IMAGE}}
+      - echo "OpenProctor deployed: server=:4000 frontend=:3000"
+
+  # Create the Postgres DB + apply schema (idempotent).
+  schema:
+    desc: Ensure openproctor DB exists and apply schema.sql
+    cmds:
+      - docker exec tao-ce-pgsql-1 psql -U postgres -c "CREATE DATABASE openproctor;" || true
+      - docker exec -i tao-ce-pgsql-1 psql -U postgres -d openproctor -f /dev/stdin < ./server/src/schema.sql
+
+  # ---------------------------------------------------------------------------
+  # TAO CE recovery (post pod-wipe).
+  #
+  # After a remote-host pod wipe the podman image store and /opt/tao-ce/* may be
+  # gone, and ElasticSearch can keep a STALE index whose mapping conflicts with the
+  # one the hierarchy service applies on boot. That conflict makes `tao-ce.hierarchy`
+  # crash-loop -> auth-server returns 500 on POST /oauth2/tokens -> login fails.
+  #
+  # This task:
+  #   1. brings the base stack up (proxy + dev-1 + pgsql/redis/es/...),
+  #   2. reloads the pre-built app images and exports them to /opt/tao-ce,
+  #   3. starts all systemd units,
+  #   4. deletes any stale `portal-hierarchy` ES index (text->keyword conflict),
+  #   5. restarts hierarchy so it recreates a clean index,
+  #   6. re-runs `tao-ce.setup.service` so the root hierarchy doc, the `portal`
+  #      DB, and the seeded admin user are recreated (idempotent).
+  # ---------------------------------------------------------------------------
+  recover:taoce:
+    desc: Recover the TAO CE stack after a pod wipe (one command)
+    cmds:
+      # 1. base containers (proxy + dev-1 + datastores)
+      - docker compose -f ../tao-ce/docker-compose.dev.yml up -d
+      # 2. reload pre-built images + export to /opt/tao-ce + start units
+      - task: recover:taoce:load
+      # 3. fix stale ES mapping that crash-loops hierarchy -> 500 on login
+      - task: recover:taoce:fix-es
+      # 4. re-seed root hierarchy + portal DB + admin user
+      - task: recover:taoce:setup
+
+  recover:taoce:load:
+    desc: Load podman images, export to /opt/tao-ce, start units
+    cmds:
+      - docker exec tao-ce-dev-1 sh -c 'set -e; for t in /teamspace/studios/this_studio/.tao-ce-images/localhost_tao-ce_apps_*.tar /teamspace/studios/this_studio/.tao-ce-images/localhost_tao-ce_builds_*.tar; do [ -f "$t" ] && podman load -i "$t"; done'
+      - docker exec tao-ce-dev-1 sh -c 'set -e; for app in $(podman images --format "{{.Repository}}" | grep "localhost/tao-ce/apps/" | sed "s#localhost/tao-ce/apps/##"); do m=$(podman image mount "localhost/tao-ce/apps/$app:dev-latest"); rsync -al "$m/" "/opt/tao-ce/$app/"; podman image unmount "localhost/tao-ce/apps/$app:dev-latest"; done'
+      - docker exec tao-ce-dev-1 sh -c 'set -e; for s in /opt/tao-ce/*/meta/systemd/*.service; do sudo systemctl enable --force "$s"; done'
+      - docker exec tao-ce-dev-1 sh -c 'sudo systemctl restart --no-block tao-ce.target'
+
+  recover:taoce:fix-es:
+    desc: Delete stale portal-hierarchy ES index (text->keyword mapping conflict) and restart hierarchy
+    cmds:
+      # hierarchy crash-loops if the existing index has organizationId: text but the
+      # service wants keyword. Deleting the index lets it recreate cleanly.
+      - docker exec tao-ce-es-1 sh -c 'curl -sk -X DELETE "http://localhost:9200/portal-hierarchy" || true'
+      - docker exec tao-ce-dev-1 sh -c 'sudo systemctl restart tao-ce.hierarchy.service'
+      # wait until hierarchy is active and not crash-looping
+      - docker exec tao-ce-dev-1 sh -c 'for i in $(seq 1 30); do [ "$(systemctl is-active tao-ce.hierarchy.service)" = "active" ] && [ "$(systemctl show -p NRestarts --value tao-ce.hierarchy.service)" = "0" ] && break; sleep 2; done; echo "hierarchy=$(systemctl is-active tao-ce.hierarchy.service) restarts=$(systemctl show -p NRestarts --value tao-ce.hierarchy.service)"'
+
+  recover:taoce:setup:
+    desc: Re-seed root hierarchy + ES (the auth-server 500-before-login source)
+    cmds:
+      # The portal init service is gated by /var/lib/tao-ce/portal/users_loaded.json
+      # (ConditionPathExists=!...). After a wipe the index is gone but that gate
+      # file may survive, so remove it and re-run init to re-create the root
+      # hierarchy doc + ES mappings + demo/admin seed (loaded into ElasticSearch
+      # by INSTALL_POPULATE, e.g. admin+demo5.json).
+      - docker exec tao-ce-dev-1 sh -c 'sudo rm -f /var/lib/tao-ce/portal/users_loaded.json; sudo systemctl restart --no-block tao-ce.portal.init.service'
+      # verify the root hierarchy doc now exists (count should be >= 1)
+      - docker exec tao-ce-dev-1 sh -c 'for i in $(seq 1 30); do c=$(curl -sk "http://localhost:9200/portal-hierarchy/_count" | grep -o "\"count\":[0-9]*" | grep -o "[0-9]*"); [ "${c:-0}" -gt 0 ] && break; sleep 2; done; echo "portal-hierarchy docs=${c:-0}"'
+      # NOTE on login (401 after the 500 is fixed):
+      # The portal service stores data in ElasticSearch + Firestore (NOT Postgres --
+      # the `portal` PG DB is unused by this build). The seed users from
+      # INSTALL_POPULATE land in the `portal-user` ES index, but the
+      # auth-server validates credentials against Firestore. If Firestore has no
+      # users after a wipe, run the TAO CE user seed/sync step that
+      # populates Firestore (the legacy `tao/scripts/cli/taoUpdate.php`
+      # path does NOT exist in this CE build -- use the supported
+      # `tao-ce.setup.service` + portal init, then trigger the Firestore
+      # user sync). Without a seeded admin in Firestore, login returns 401.
+
+  # Full recovery helper (TAO CE + OpenProctor).
+  recover:
+    desc: Recover everything after a wipe (TAO CE stack + OpenProctor)
+    cmds:
+      - task: recover:taoce
+      - task: deploy

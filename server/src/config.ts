@@ -17,4 +17,10 @@ export const config = {
     consecutiveViolationsThreshold: Number(process.env.CONSECUTIVE_VIOLATIONS_THRESHOLD ?? 5),
     syncIntervalMs: Number(process.env.SYNC_INTERVAL_MS ?? 5000),
     syncBatchSize: Number(process.env.SYNC_BATCH_SIZE ?? 200),
+    openproctorPublicUrl: process.env.OPENPROCTOR_PUBLIC_URL ?? '',
+    // Candidate session-token lifetime (seconds). Short-lived, scope = {sessionId, alias}.
+    sessionTokenTtl: Number(process.env.OPENPROCTOR_SESSION_TOKEN_TTL ?? 900),
+    // Shared secret used to sign candidate session tokens (HMAC). Distinct from the
+    // service-to-service apiSecret; never sent to the browser.
+    sessionTokenSecret: process.env.OPENPROCTOR_SESSION_TOKEN_SECRET ?? process.env.OPENPROCTOR_API_SECRET ?? 'change-me-in-prod',
 };

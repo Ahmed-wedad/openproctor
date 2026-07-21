@@ -1,0 +1,35 @@
+# OpenProctor CI — build & push images to GHCR.
+#
+# Survives remote-host wipes: after a pod wipe, recovery is
+#   docker compose -f docker-compose.dev.yml up -d
+#   go-task openproctor:deploy   (pulls these images, applies schema, restarts caddy)
+#
+# Reuses the TAO CE reusable build-image workflow (multi-arch amd64/arm64, GHCR cache).
+name: OpenProctor CI
+
+on:
+  push:
+    branches: [main, 'build/**']
+    tags: ['*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  server:
+    uses: ./.github/workflows/build-openproctor-image.yml
+    with:
+      image: openproctor-server
+      context: ./server
+      dockerfile: ./server/Dockerfile
+
+  frontend:
+    uses: ./.github/workflows/build-openproctor-image.yml
+    with:
+      image: openproctor-frontend
+      context: .
+      dockerfile: ./app/Dockerfile

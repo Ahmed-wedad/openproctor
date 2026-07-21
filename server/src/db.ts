@@ -8,6 +8,7 @@ export async function initDb(): Promise<void> {
     await pool.query(`CREATE TABLE IF NOT EXISTS sessions (
         id TEXT PRIMARY KEY,
         status TEXT NOT NULL DEFAULT 'active',
+        liveness_passed BOOLEAN NOT NULL DEFAULT FALSE,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )`);
@@ -55,4 +56,16 @@ export async function setSessionStatus(id: string, status: string): Promise<void
         `UPDATE sessions SET status = $2, updated_at = now() WHERE id = $1`,
         [id, status],
     );
+}
+
+export async function setLivenessPassed(id: string, passed: boolean): Promise<void> {
+    await pool.query(
+        `UPDATE sessions SET liveness_passed = $2, updated_at = now() WHERE id = $1`,
+        [id, passed],
+    );
+}
+
+export async function isLivenessPassed(id: string): Promise<boolean> {
+    const result = await pool.query(`SELECT liveness_passed FROM sessions WHERE id = $1`, [id]);
+    return result.rows.length > 0 && result.rows[0].liveness_passed === true;
 }

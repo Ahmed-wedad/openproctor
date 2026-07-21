@@ -6,6 +6,7 @@ import { TelemetryFlag } from '../types/proctor';
 export interface TelemetryClientOptions {
     sessionId: string;
     serverUrl: string;          // base URL of the microservice (e.g. http://localhost:4000)
+    sessionToken?: string;      // candidate sessionToken (ACTIVE, after liveness) — used for the /api/v1/telemetry candidate endpoint
     batchSize?: number;         // flush when buffer reaches this size (default 10)
     flushIntervalMs?: number;   // periodic flush interval (default 2000ms)
     onError?: (error: Error) => void;
@@ -17,12 +18,16 @@ export class TelemetryClient {
     private readonly batchSize: number;
     private readonly flushIntervalMs: number;
     private readonly endpoint: string;
+    private readonly sessionToken?: string;
     private flushing = false;
 
     constructor(private options: TelemetryClientOptions) {
         this.batchSize = options.batchSize ?? 10;
         this.flushIntervalMs = options.flushIntervalMs ?? 2000;
-        this.endpoint = `${options.serverUrl.replace(/\/$/, '')}/api/telemetry`;
+        // CANDIDATE graph: telemetry goes to /api/v1/telemetry and is authenticated by
+        // the per-session signed sessionToken (never the service shared secret).
+        this.endpoint = `${options.serverUrl.replace(/\/$/, '')}/api/v1/telemetry`;
+        this.sessionToken = options.sessionToken;
         this.timer = setInterval(() => this.flush(), this.flushIntervalMs);
     }
 
@@ -38,10 +43,12 @@ export class TelemetryClient {
         this.flushing = true;
         const batch = this.buffer.splice(0, this.buffer.length);
         try {
+            const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+            if (this.sessionToken) headers['X-OpenProctor-Session-Token'] = this.sessionToken;
             const res = await fetch(this.endpoint, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sessionId: this.options.sessionId, flags: batch }),
+                headers,
+                body: JSON.stringify({ sessionId: this.options.sessionId, token: this.sessionToken, flags: batch }),
             });
             if (!res.ok) {
                 throw new Error(`Telemetry upload failed: ${res.status} ${res.statusText}`);

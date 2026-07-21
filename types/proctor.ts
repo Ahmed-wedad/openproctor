@@ -14,6 +14,9 @@ export interface ProctorOptions {
     // Phase 3 (2.3/3): telemetry + snapshot upload
     sessionId?: string;
     telemetryServerUrl?: string;
+    // CANDIDATE graph: ACTIVE per-session signed token (after liveness) used to
+    // authenticate telemetry/snapshot to the microservice. Never the shared secret.
+    sessionToken?: string;
     onTelemetryError?: (error: Error) => void;
 }
 

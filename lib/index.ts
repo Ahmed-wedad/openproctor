@@ -86,6 +86,8 @@ export class Proctor {
             Proctor.telemetryClient = new TelemetryClient({
                 sessionId: options.sessionId,
                 serverUrl: options.telemetryServerUrl,
+                // CANDIDATE graph: pass the ACTIVE sessionToken so telemetry is authenticated.
+                sessionToken: options.sessionToken,
                 onError: options.onTelemetryError,
             });
         }
